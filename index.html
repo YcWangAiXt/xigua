@@ -55,6 +55,15 @@
     padding:0 12px;border-radius:11px;font-family:inherit;
   }
   #fsBtn:active{background:#f3e4c8;}
+  #sndBtn{
+    appearance:none;border:1px solid var(--wood);background:rgba(255,251,242,.9);
+    width:44px;height:44px;min-width:44px;padding:0;border-radius:11px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  #sndBtn:active{background:#f3e4c8;}
+  #sndBtn.muted{background:#f0e2c6;}
+  #sndBtn.muted #sndWave1,#sndBtn.muted #sndWave2{display:none;}
+  #sndBtn:not(.muted) #sndMute{display:none;}
   /* ---------- 分数行 ---------- */
   #scoreRow{display:flex;align-items:flex-end;gap:10px;padding:0 2px;}
   #score{
@@ -139,6 +148,14 @@
 <div id="app">
   <header id="hud">
     <div id="brand">合成大西瓜<small>iOS · 手机版</small></div>
+    <button id="sndBtn" type="button" aria-label="声音开关">
+      <svg viewBox="0 0 24 24" width="21" height="21" aria-hidden="true">
+        <path d="M3.6 9.1h3.3L11.6 5v14L6.9 14.9H3.6z" fill="#6f5232"/>
+        <path id="sndWave1" d="M14.9 8.5a5 5 0 0 1 0 7" stroke="#6f5232" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+        <path id="sndWave2" d="M17.6 6.1a8.5 8.5 0 0 1 0 11.8" stroke="#6f5232" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+        <path id="sndMute" d="M15.2 9.4l4.4 5.2M19.6 9.4l-4.4 5.2" stroke="#c93a3a" stroke-width="1.9" fill="none" stroke-linecap="round"/>
+      </svg>
+    </button>
     <button id="fsBtn" type="button">全屏</button>
   </header>
 
@@ -894,8 +911,12 @@ function toast(msg){
    全部 WebAudio 现场合成，不依赖任何音频文件
 */
 
-let AC = null, BUS = null, RVS = null, NOISEBUF = null;
+let AC = null, BUS = null, BOOST = null, RVS = null, NOISEBUF = null;
 let LAST_DROP = 0, PMERGE = null;
+let MUTED = false, UNLOCK_TRIED = false;
+
+// 整体电平：手机扬声器上 -17dB 几乎听不见，抬到 -10dB 左右
+const LEVEL = 2.4;
 
 function audioCtx(){
   if (!AC){
@@ -904,17 +925,19 @@ function audioCtx(){
     try {
       AC = new C();
       BUS = AC.createGain();
-      BUS.gain.value = 0.88;
+      BUS.gain.value = 1;
+      BOOST = AC.createGain();
+      BOOST.gain.value = MUTED ? 0 : LEVEL;
       if (AC.createDynamicsCompressor){
         const cp = AC.createDynamicsCompressor();
-        cp.threshold.value = -16;      // 抬头的压一下，避免大西瓜爆音
-        cp.knee.value = 22;
-        cp.ratio.value = 4;
-        cp.attack.value = 0.004;
-        cp.release.value = 0.14;
-        BUS.connect(cp); cp.connect(AC.destination);
+        cp.threshold.value = -9;       // 只压过头的地方，别把正常声音一起压小
+        cp.knee.value = 18;
+        cp.ratio.value = 3;
+        cp.attack.value = 0.005;
+        cp.release.value = 0.15;
+        BUS.connect(BOOST); BOOST.connect(cp); cp.connect(AC.destination);
       } else {
-        BUS.connect(AC.destination);
+        BUS.connect(BOOST); BOOST.connect(AC.destination);
       }
     } catch(e){ AC = null; return null; }
   }
@@ -956,6 +979,7 @@ function noiseBuffer(a){
 
 // o = {freq, slideTo, dur, gain, type, attack, delay, pan, rev}
 function tone(o){
+  if (MUTED) return;
   const a = audioCtx(); if (!a) return;
   const t0 = a.currentTime + (o.delay || 0);
   const dur = o.dur || 0.15;
@@ -982,6 +1006,7 @@ function tone(o){
 
 // o = {dur, gain, hp|bp|q|lp, delay, pan, rev}
 function noise(o){
+  if (MUTED) return;
   const a = audioCtx(); if (!a) return;
   const t0 = a.currentTime + (o.delay || 0);
   const dur = o.dur || 0.06;
@@ -1032,20 +1057,20 @@ function dropSound(lv, x){
   const dur = 0.045 + big * 0.07;                        // 45~115ms
   // 接触"噗"：低频闷响，随大小越长越厚
   tone({ freq: f0, slideTo: f0 * 0.7, dur: dur,
-         gain: (0.072 + big * 0.05) * vol * jit(0.9, 1.1),
+         gain: (0.061 + big * 0.042) * vol * jit(0.9, 1.1),
          type: 'sine', attack: 0.004, pan: pan });
   // 轻点：小水果更清脆，几乎无刺耳高频
   noise({ dur: 0.022 + big * 0.018,
-          gain: (0.048 * (1 - big) + 0.008) * vol * jit(0.9, 1.1),
+          gain: (0.040 * (1 - big) + 0.0074) * vol * jit(0.9, 1.1),
           hp: 1500 + (1 - big) * 1500, pan: pan });
   // 果肉/水声：偶尔露出一点"多汁"
   if (Math.random() < 0.45)
-    noise({ dur: 0.055, gain: (0.016 + big * 0.014) * vol,
+    noise({ dur: 0.055, gain: (0.014 + big * 0.0116) * vol,
             bp: 640 + big * 260, q: 0.9, delay: 0.008, pan: pan });
   // 大水果多一层轻微弹跳"咕噜"
   if (big > 0.55 && Math.random() < 0.3)
     tone({ freq: f0 * 2.1, slideTo: f0 * 1.5, dur: 0.05,
-           gain: 0.028 * vol, type: 'sine', delay: 0.05, pan: pan });
+           gain: 0.023 * vol, type: 'sine', delay: 0.05, pan: pan });
 }
 
 /* ---- 合成声：亮、弹、有递进 ---- */
@@ -1119,11 +1144,43 @@ function overSound(){
   }
 }
 
+// 点击喇叭时的确认音：一听就知道有没有声
+function testSound(){
+  if (MUTED) return;
+  tone({ freq: 660, dur: 0.10, gain: 0.30, type: 'triangle', rev: 0.4 });
+  tone({ freq: 990, dur: 0.15, gain: 0.22, type: 'sine', delay: 0.07, rev: 0.5 });
+  noise({ dur: 0.05, gain: 0.03, bp: 1600, q: 1.2 });
+}
+
+function applyMute(){
+  const btn = document.getElementById('sndBtn');
+  if (btn) btn.classList.toggle('muted', MUTED);
+  if (BOOST) BOOST.gain.value = MUTED ? 0 : LEVEL;
+  try { localStorage.setItem('xigua_mute', MUTED ? '1' : '0'); } catch(e){}
+}
+
+// 任何一次触摸都尝试解锁（iOS 要求手势内 resume）
+function unlockAudio(){
+  const a = audioCtx();
+  if (!a) return;
+  if (a.state !== 'running') a.resume().catch(function(){});
+  if (!UNLOCK_TRIED){
+    UNLOCK_TRIED = true;
+    setTimeout(function(){
+      const x = AC;
+      if (x && x.state !== 'running' && !MUTED)
+        toast('声音没启动：请再点一下屏幕，并检查手机左侧静音开关');
+    }, 900);
+  }
+}
+
 function sfx(name, lv, x){
   if (name === 'drop') dropSound(lv, x);
   else if (name === 'release'){
-    tone({ freq: 330 + jit(-18, 18), slideTo: 185, dur: 0.055, gain: 0.034,
+    tone({ freq: 330 + jit(-18, 18), slideTo: 185, dur: 0.055, gain: 0.035,
            type: 'sine', attack: 0.004, pan: dpan(x) });
+  } else if (name === 'test'){
+    testSound();
   }
   else if (name === 'merge') mergeSound(lv, x, 0);
   else if (name === 'bomb') bombSound(x);
@@ -1437,6 +1494,24 @@ document.querySelectorAll('.prop').forEach(btn => {
     if (G.props[k] <= 0){ toast('这个道具已经用完了'); return; }
     useProp(k);
   });
+});
+
+try {
+  if (localStorage.getItem('xigua_mute') === '1') MUTED = true;
+} catch(e){}
+applyMute();
+
+document.getElementById('sndBtn').addEventListener('click', function(){
+  MUTED = !MUTED;
+  applyMute();
+  if (!MUTED){
+    unlockAudio();
+    testSound();
+  }
+});
+
+['pointerdown', 'touchstart', 'click', 'keydown'].forEach(function(ev){
+  document.addEventListener(ev, unlockAudio, { passive: true });
 });
 
 document.getElementById('fsBtn').addEventListener('click', () => {
