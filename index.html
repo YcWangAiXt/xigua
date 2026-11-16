@@ -600,17 +600,25 @@ const G = {
   aimMode: null, aimX: LW/2, aimY: (BOX_T+BOX_B)/2,
   bombs: [], effects: [],
   shakeT: 0, danger: 0, last: 0, acc: 0, running: false,
+  comboT: 0, comboN: 0,
 };
 
 function newFruit(lv, x, y){
   const cfg = LV[lv-1];
-  return { lv, x, y, vx: 0, vy: 0, r: cfg.r, m: cfg.r * cfg.r };
+  return { lv, x, y, vx: 0, vy: 0, r: cfg.r, m: cfg.r * cfg.r, landed: false };
+}
+
+// 待投放水果的高度：小水果悬在上方，大水果上边缘刚好贴到画布顶，不被裁
+function pendingY(lv){
+  const m = imgMeta[lv] || { ar: 1, cy: 0.5 };
+  const h = LV[lv-1].r * 2 * 1.03 * m.ar;
+  return Math.max(BOX_T - 54, m.cy * h - 2);
 }
 
 function spawnPending(){
   G.nextLv = G.nextLv || SPAWN_POOL[Math.floor(Math.random()*SPAWN_POOL.length)];
   const lv = G.nextLv;
-  G.pending = newFruit(lv, clamp(G.mouseX, BOX_L + LV[lv-1].r, BOX_R - LV[lv-1].r), BOX_T - 54);
+  G.pending = newFruit(lv, clamp(G.mouseX, BOX_L + LV[lv-1].r, BOX_R - LV[lv-1].r), pendingY(lv));
   G.nextLv = SPAWN_POOL[Math.floor(Math.random()*SPAWN_POOL.length)];
   drawNext();
 }
@@ -622,7 +630,8 @@ function drop(){
   G.pending = null;
   G.cool = DROP_COOL;
   spawnPending();
-  sfx('drop');
+  sfx('release', f.lv, f.x);   // 离手：极轻的一声，真正的落地声在接触时
+
 }
 
 /* ---------- 物理 ---------- */
@@ -658,12 +667,13 @@ function mergePair(a, b){
   } else {
     const f = newFruit(lv, mx, my);
     f.vx = mvx; f.vy = mvy;
+    f.landed = true;
     F.push(f);
     G.score += LV[lv-1].score;
     addRipple(mx, my, LV[lv-1].r * 1.9, LV[lv-1].light);
     addText(mx, my, '+' + LV[lv-1].score, LV[lv-1].dark);
   }
-  sfx('merge', Math.min(MAX_LV, a.lv + 1));
+  queueMerge(Math.min(MAX_LV, a.lv + 1), mx);
   bumpScore();
 }
 
@@ -708,6 +718,7 @@ function solvePairs(){
 
 function physics(dt){
   for (const f of G.fruits){
+    f.pvy = f.vy;                       // 本步开始前的竖直速度，用来判断是否撞到东西
     f.vy += GRAVITY * dt;
     f.x += f.vx * dt;
     f.y += f.vy * dt;
@@ -719,6 +730,13 @@ function physics(dt){
   for (const f of G.fruits){
     if (Math.abs(f.vx) < 1.2) f.vx = 0;
     if (Math.abs(f.vy) < 1.2) f.vy = 0;
+  }
+  // 首次接触：下落被挡住的那一刻才是"落地声"，每颗水果只响一次
+  for (const f of G.fruits){
+    if (!f.landed && f.pvy > 55 && f.vy < f.pvy * 0.6){
+      f.landed = true;
+      dropSound(f.lv, f.x);
+    }
   }
 }
 
@@ -810,7 +828,7 @@ function placeStar(x, y){
   target.r = cfg.r; target.m = cfg.r * cfg.r;
   addRipple(target.x, target.y, cfg.r * 1.9, cfg.light);
   addText(target.x, target.y - cfg.r - 14, '升级！', '#b7791f');
-  sfx('star');
+  sfx('star', target.lv, target.x);
 }
 
 function explode(x, y){
@@ -827,7 +845,7 @@ function explode(x, y){
                      t:-i*0.05, life:0.40, color:i ? '#ffd07a' : '#ff8a2b' });
   }
   addSpark(x, y, 12);
-  sfx('bomb');
+  sfx('bomb', 0, x);
   G.shakeT = Math.max(G.shakeT, 0.18);
   addText(x, y - 24, victim ? '炸掉 1 个' : '附近没有水果', victim ? '#d2453a' : '#8b7861');
   syncProps();
@@ -870,71 +888,263 @@ function toast(msg){
   toastTimer = setTimeout(() => elToast.classList.remove('on'), 1600);
 }
 
-/* ---------- 音效：WebAudio 现场合成，不依赖任何音频文件 ---------- */
-let AC = null;
+/* ---------- 音效引擎 ----------
+   落下声 = 物理反馈：软、短、低存在感，随水果大小变化
+   合成声 = 奖励反馈：亮、弹、五声音阶递进，等级越高压迫感与满足感越强
+   全部 WebAudio 现场合成，不依赖任何音频文件
+*/
+
+let AC = null, BUS = null, RVS = null, NOISEBUF = null;
+let LAST_DROP = 0, PMERGE = null;
+
 function audioCtx(){
   if (!AC){
     const C = window.AudioContext || window.webkitAudioContext;
     if (!C) return null;
-    try { AC = new C(); } catch(e){ return null; }
+    try {
+      AC = new C();
+      BUS = AC.createGain();
+      BUS.gain.value = 0.88;
+      if (AC.createDynamicsCompressor){
+        const cp = AC.createDynamicsCompressor();
+        cp.threshold.value = -16;      // 抬头的压一下，避免大西瓜爆音
+        cp.knee.value = 22;
+        cp.ratio.value = 4;
+        cp.attack.value = 0.004;
+        cp.release.value = 0.14;
+        BUS.connect(cp); cp.connect(AC.destination);
+      } else {
+        BUS.connect(AC.destination);
+      }
+    } catch(e){ AC = null; return null; }
   }
-  if (AC.state === 'suspended'){ AC.resume().catch(() => {}); }
+  if (AC.state === 'suspended'){ AC.resume().catch(function(){}); }
   return AC;
 }
 
-function beep(freq, dur, gain, type, slideTo){
-  const a = audioCtx(); if (!a) return;
-  const o = a.createOscillator(), g = a.createGain();
-  o.type = type || 'sine';
-  o.frequency.setValueAtTime(freq, a.currentTime);
-  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, a.currentTime + dur);
-  g.gain.setValueAtTime(gain, a.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
-  o.connect(g); g.connect(a.destination);
-  o.start(); o.stop(a.currentTime + dur + 0.02);
+function jit(a, b){ return a + Math.random() * (b - a); }
+
+// 合成位置 -> 轻微立体声
+function dpan(x){
+  return clamp(((x === undefined ? LW / 2 : x) / LW - 0.5) * 1.1, -0.85, 0.85);
 }
 
-function noiseBurst(dur, gain, hp){
-  const a = audioCtx(); if (!a) return;
-  const n = Math.max(1, Math.floor(a.sampleRate * dur));
+// 轻量反馈式混响，给大水果一点尾巴
+function reverbIn(){
+  const a = audioCtx(); if (!a) return null;
+  if (RVS) return RVS;
+  const dl = a.createDelay(1.2);
+  dl.delayTime.value = 0.048;
+  const fb = a.createGain(); fb.gain.value = 0.46;
+  const lp = a.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 2400;
+  const out = a.createGain(); out.gain.value = 0.28;
+  dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(out);
+  out.connect(BUS || a.destination);
+  RVS = dl;
+  return RVS;
+}
+
+function noiseBuffer(a){
+  if (NOISEBUF && NOISEBUF.sampleRate === a.sampleRate) return NOISEBUF;
+  const n = Math.floor(a.sampleRate * 1.0);
   const buf = a.createBuffer(1, n, a.sampleRate);
   const d = buf.getChannelData(0);
-  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / n);
-  const src = a.createBufferSource(); src.buffer = buf;
-  const g = a.createGain();
-  g.gain.setValueAtTime(gain, a.currentTime);
-  g.gain.exponentialRampToValueAtTime(0.0001, a.currentTime + dur);
-  if (hp){
-    const f = a.createBiquadFilter();
-    f.type = 'highpass'; f.frequency.value = hp;
-    src.connect(f); f.connect(g);
-  } else {
-    src.connect(g);
-  }
-  g.connect(a.destination);
-  src.start();
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  NOISEBUF = buf;
+  return buf;
 }
 
-function sfx(name, lv){
-  if (name === 'drop'){
-    beep(270, 0.10, 0.16, 'sine', 95);
-  } else if (name === 'merge'){
-    const base = 300 + Math.min(MAX_LV, lv || 1) * 52;
-    beep(base, 0.13, 0.20, 'triangle');
-    setTimeout(function(){ beep(base * 1.34, 0.12, 0.14, 'triangle'); }, 55);
-    if ((lv || 1) >= 9) setTimeout(function(){ beep(base * 1.9, 0.15, 0.12, 'triangle'); }, 120);
-  } else if (name === 'bomb'){
-    noiseBurst(0.22, 0.34, 300);
-    beep(95, 0.20, 0.20, 'sine', 40);
-  } else if (name === 'shake'){
-    noiseBurst(0.26, 0.15, 900);
-  } else if (name === 'star'){
-    beep(520, 0.10, 0.15, 'triangle');
-    setTimeout(function(){ beep(680, 0.10, 0.15, 'triangle'); }, 70);
-    setTimeout(function(){ beep(880, 0.14, 0.15, 'triangle'); }, 140);
-  } else if (name === 'over'){
-    beep(440, 0.45, 0.18, 'sine', 130);
+// o = {freq, slideTo, dur, gain, type, attack, delay, pan, rev}
+function tone(o){
+  const a = audioCtx(); if (!a) return;
+  const t0 = a.currentTime + (o.delay || 0);
+  const dur = o.dur || 0.15;
+  const osc = a.createOscillator();
+  osc.type = o.type || 'sine';
+  osc.frequency.setValueAtTime(Math.max(24, o.freq), t0);
+  if (o.slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(24, o.slideTo), t0 + dur);
+  const g = a.createGain();
+  const peak = Math.max(0.0002, o.gain || 0.2);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(peak, t0 + (o.attack || 0.005));
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  let node = g;
+  osc.connect(g);
+  if (a.createStereoPanner){
+    const p = a.createStereoPanner();
+    p.pan.value = o.pan || 0;
+    g.connect(p); node = p;
   }
+  node.connect(BUS || a.destination);
+  if (o.rev){ const R = reverbIn(); if (R){ const rg = a.createGain(); rg.gain.value = Math.min(1, o.rev); node.connect(rg); rg.connect(R); } }
+  osc.start(t0); osc.stop(t0 + dur + 0.04);
+}
+
+// o = {dur, gain, hp|bp|q|lp, delay, pan, rev}
+function noise(o){
+  const a = audioCtx(); if (!a) return;
+  const t0 = a.currentTime + (o.delay || 0);
+  const dur = o.dur || 0.06;
+  const src = a.createBufferSource();
+  src.buffer = noiseBuffer(a);
+  const f = a.createBiquadFilter();
+  if (o.bp){ f.type = 'bandpass'; f.frequency.value = o.bp; f.Q.value = o.q || 1.1; }
+  else if (o.hp){ f.type = 'highpass'; f.frequency.value = o.hp; }
+  else if (o.lp){ f.type = 'lowpass'; f.frequency.value = o.lp; }
+  else { f.type = 'lowpass'; f.frequency.value = 6000; }
+  const g = a.createGain();
+  const peak = Math.max(0.0002, o.gain || 0.08);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(peak, t0 + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  let node = g;
+  src.connect(f); f.connect(g);
+  if (a.createStereoPanner){
+    const p = a.createStereoPanner();
+    p.pan.value = o.pan || 0;
+    g.connect(p); node = p;
+  }
+  node.connect(BUS || a.destination);
+  if (o.rev){ const R = reverbIn(); if (R){ const rg = a.createGain(); rg.gain.value = Math.min(1, o.rev); node.connect(rg); rg.connect(R); } }
+  src.start(t0, Math.random() * 0.45, dur + 0.02);
+}
+
+// 五声音阶：等级映射音高，听得出"升一级"
+const PENTA = [0, 2, 4, 7, 9];
+function noteFreq(lv, shift){
+  const i = clamp((lv || 1) - 1 + (shift || 0), 0, 22);
+  const oct = Math.floor(i / 5);
+  const semi = PENTA[i % 5] + oct * 12;
+  return 130.81 * Math.pow(2, semi / 12);     // C3 起
+}
+
+/* ---- 落下声：软、短、可重复不烦 ---- */
+function dropSound(lv, x){
+  const a = audioCtx(); if (!a) return;
+  // 限速：连续下落时不是每下都播
+  if (a.currentTime - LAST_DROP < 0.10 && Math.random() > 0.4) return;
+  LAST_DROP = a.currentTime;
+  const r = LV[clamp(lv || 1, 1, MAX_LV) - 1].r;
+  const big = clamp((r - 16) / (108 - 16), 0, 1);       // 0 小 .. 1 西瓜
+  const pan = dpan(x);
+  const vol = PMERGE ? 0.5 : 1;                          // 合成优先，落下让位
+  const f0 = (198 - big * 62) * jit(0.94, 1.06);         // 音高 ±3~8%
+  const dur = 0.045 + big * 0.07;                        // 45~115ms
+  // 接触"噗"：低频闷响，随大小越长越厚
+  tone({ freq: f0, slideTo: f0 * 0.7, dur: dur,
+         gain: (0.072 + big * 0.05) * vol * jit(0.9, 1.1),
+         type: 'sine', attack: 0.004, pan: pan });
+  // 轻点：小水果更清脆，几乎无刺耳高频
+  noise({ dur: 0.022 + big * 0.018,
+          gain: (0.048 * (1 - big) + 0.008) * vol * jit(0.9, 1.1),
+          hp: 1500 + (1 - big) * 1500, pan: pan });
+  // 果肉/水声：偶尔露出一点"多汁"
+  if (Math.random() < 0.45)
+    noise({ dur: 0.055, gain: (0.016 + big * 0.014) * vol,
+            bp: 640 + big * 260, q: 0.9, delay: 0.008, pan: pan });
+  // 大水果多一层轻微弹跳"咕噜"
+  if (big > 0.55 && Math.random() < 0.3)
+    tone({ freq: f0 * 2.1, slideTo: f0 * 1.5, dur: 0.05,
+           gain: 0.028 * vol, type: 'sine', delay: 0.05, pan: pan });
+}
+
+/* ---- 合成声：亮、弹、有递进 ---- */
+function mergeSound(lv, x, combo){
+  lv = clamp(lv || 1, 1, MAX_LV);
+  const pan = lv >= MAX_LV ? 0 : dpan(x);                 // 大西瓜全屏化
+  const f = noteFreq(lv, Math.min(2, combo || 0));        // combo 上行，但设上限避免尖锐
+
+  if (lv <= 4){
+    // 小：水滴 / 气泡，高频清脆
+    tone({ freq: f * 0.75, slideTo: f * 1.9, dur: 0.10, gain: 0.25, type: 'sine', attack: 0.004, pan: pan });
+    tone({ freq: f * 2, slideTo: f * 2.6, dur: 0.07, gain: 0.10, type: 'sine', delay: 0.03, pan: pan });
+    noise({ dur: 0.05, gain: 0.045, bp: 1500, q: 1.4, pan: pan });
+  } else if (lv <= 8){
+    // 中：果冻弹 + 软木琴短和弦
+    tone({ freq: f, slideTo: f * 1.22, dur: 0.17, gain: 0.25, type: 'triangle', pan: pan });
+    tone({ freq: f * 1.26, dur: 0.14, gain: 0.15, type: 'triangle', delay: 0.035, pan: pan });
+    tone({ freq: f * 1.5, dur: 0.12, gain: 0.11, type: 'triangle', delay: 0.07, pan: pan });
+    noise({ dur: 0.05, gain: 0.028, bp: 520, q: 0.8, pan: pan });
+  } else if (lv <= 10){
+    // 大：低频 thump + 明亮泛音 + 短混响，厚重但仍有满足感
+    tone({ freq: 80, slideTo: 52, dur: 0.26, gain: 0.28, type: 'sine', attack: 0.006, pan: pan });
+    tone({ freq: f, slideTo: f * 1.12, dur: 0.28, gain: 0.23, type: 'triangle', pan: pan, rev: 0.5 });
+    tone({ freq: f * 2, dur: 0.16, gain: 0.12, type: 'sine', delay: 0.02, pan: pan, rev: 0.4 });
+    tone({ freq: f * 1.5, dur: 0.20, gain: 0.11, type: 'triangle', delay: 0.08, pan: pan, rev: 0.4 });
+  } else {
+    // 大西瓜：低频冲击 + 上行和弦 + 600~1000ms 混响尾巴
+    tone({ freq: 62, slideTo: 44, dur: 0.45, gain: 0.32, type: 'sine', attack: 0.008 });
+    tone({ freq: f, dur: 0.34, gain: 0.21, type: 'triangle', pan: 0, rev: 1 });
+    tone({ freq: f * 1.26, dur: 0.34, gain: 0.17, type: 'triangle', delay: 0.055, pan: 0, rev: 1 });
+    tone({ freq: f * 1.5, dur: 0.40, gain: 0.15, type: 'triangle', delay: 0.11, pan: 0, rev: 1 });
+    tone({ freq: f * 2, dur: 0.42, gain: 0.12, type: 'sine', delay: 0.16, pan: 0, rev: 1 });
+    noise({ dur: 0.10, gain: 0.045, bp: 900, q: 0.7, rev: 0.6 });
+  }
+}
+
+/* ---- 其他动作 ---- */
+function bombSound(x){
+  const pan = dpan(x);
+  // 软果冻爆开，不做爆炸/金属感
+  tone({ freq: 128, slideTo: 52, dur: 0.18, gain: 0.23, type: 'sine', pan: pan });
+  noise({ dur: 0.14, gain: 0.095, bp: 780, q: 0.6, pan: pan });
+  noise({ dur: 0.07, gain: 0.05, hp: 2600, delay: 0.02, pan: pan });
+  if (Math.random() < 0.5) noise({ dur: 0.06, gain: 0.028, bp: 400, delay: 0.05, pan: pan });
+}
+
+function shakeSound(){
+  // 一串短促"咕噜"，不是一声长噪声
+  for (let i = 0; i < 4; i++){
+    tone({ freq: 150 + i * 22, slideTo: 105 + i * 16, dur: 0.07,
+           gain: Math.max(0.018, 0.055 - i * 0.009), type: 'sine',
+           delay: i * 0.055, pan: Math.sin(i * 1.7) * 0.42 });
+    noise({ dur: 0.045, gain: 0.018, hp: 900, delay: i * 0.055 });
+  }
+}
+
+function starSound(lv, x){
+  const pan = dpan(x);
+  const f = noteFreq(clamp(lv || 1, 1, MAX_LV), 0);
+  tone({ freq: f * 0.9, slideTo: f * 1.7, dur: 0.12, gain: 0.19, type: 'sine', pan: pan });
+  tone({ freq: f * 1.5, dur: 0.10, gain: 0.13, type: 'triangle', delay: 0.06, pan: pan, rev: 0.5 });
+  tone({ freq: f * 2, dur: 0.12, gain: 0.11, type: 'sine', delay: 0.12, pan: pan, rev: 0.5 });
+  noise({ dur: 0.05, gain: 0.028, bp: 1800, delay: 0.02, pan: pan });
+}
+
+function overSound(){
+  const seq = [392, 311, 233];
+  for (let i = 0; i < seq.length; i++){
+    tone({ freq: seq[i], slideTo: seq[i] * 0.94, dur: 0.24, gain: 0.15,
+           type: 'triangle', delay: i * 0.13, rev: 0.45 });
+  }
+}
+
+function sfx(name, lv, x){
+  if (name === 'drop') dropSound(lv, x);
+  else if (name === 'release'){
+    tone({ freq: 330 + jit(-18, 18), slideTo: 185, dur: 0.055, gain: 0.034,
+           type: 'sine', attack: 0.004, pan: dpan(x) });
+  }
+  else if (name === 'merge') mergeSound(lv, x, 0);
+  else if (name === 'bomb') bombSound(x);
+  else if (name === 'shake') shakeSound();
+  else if (name === 'star') starSound(lv, x);
+  else if (name === 'over') overSound();
+}
+
+/* ---- 同帧多个合成只播最高等级 ---- */
+function queueMerge(lv, x){
+  if (!PMERGE || lv > PMERGE.lv) PMERGE = { lv: lv, x: x };
+}
+
+function flushMerge(){
+  if (!PMERGE) return;
+  const q = PMERGE; PMERGE = null;
+  const t = (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
+  if (t - (G.comboT || 0) < 0.55) G.comboN = Math.min(3, (G.comboN || 0) + 1);
+  else G.comboN = 0;
+  G.comboT = t;
+  mergeSound(q.lv, q.x, G.comboN);
 }
 
 /* ---------- 渲染 ---------- */
@@ -1131,12 +1341,13 @@ function tick(now){
     if (G.pending){
       const cfg = LV[G.pending.lv-1];
       G.pending.x = clamp(G.mouseX, BOX_L + cfg.r, BOX_R - cfg.r);
-      G.pending.y = BOX_T - 54;
+      G.pending.y = pendingY(G.pending.lv);
     }
   } else {
     updateEffects(dt);
     if (G.shakeT > 0) G.shakeT -= dt;
   }
+  flushMerge();
   render(dt);
   requestAnimationFrame(tick);
 }
